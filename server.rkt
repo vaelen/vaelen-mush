@@ -36,7 +36,7 @@
   (cond
     [(player? current-player)
      (hash-remove! players (player-name current-player))
-     (send-message-to-room (player-room current-player) (format "player ~a has logged out." (player-name current-player)))])
+     (send-message-to-room (player-room current-player) (format "~a has logged out." (player-name current-player)))])
   #f)
 
 (define (read-trimmed-line in current-player)
