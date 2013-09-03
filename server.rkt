@@ -1,5 +1,5 @@
 #lang racket
-(require "tcp-server.rkt")
+(require racket/date)
 
 (provide 
  (all-defined-out)
@@ -8,7 +8,9 @@
  (struct-out door)
  (struct-out command))
 
-(struct player (name room in out) #:mutable)
+; ########## Data Structures ##########
+
+(struct player (name room in out remote-ip remote-port) #:mutable)
 (struct room (id name description inventory doors) #:mutable)
 (struct door (names description) #:mutable)
 (struct command (name description function) #:mutable)
@@ -26,24 +28,77 @@
 (define (get-command name)
   (hash-ref commands name #f))
 
-(hash-set! rooms 'main (room 'main 
-      "Entrance Hall" 
-      "This is where new players appear before they enter the game."
-      '()
-      (list (door '("north" "n") "A path to the north leads to town."))))
+; ########## Logging Code ##########
+
+(define LOG-PORT (current-output-port))
+(define LOG-UTC #f)
+
+(define (init-logging)
+  ; TODO: Load from config file
+  (date-display-format 'rfc2822))
+
+(define (log message [level 'info])
+    (fprintf LOG-PORT "[~a](~a) ~a~n" (date->string (current-date) #t) level message))
+
+; ########## TCP Server Code ##########
+
+(define (serve description port-number handler)
+  (define main-cust (make-custodian))
+  (parameterize ([current-custodian main-cust])
+    (define listener (tcp-listen port-number 5 #t))
+    (define (start-server) 
+      (log (format "Starting ~a server on port ~a." description port-number))
+      (server-loop))
+    (define (server-loop)
+      (accept-and-handle listener handler)
+      (server-loop))
+    (define t (thread start-server))
+    (lambda ()
+      (log (format "Shutting down ~a server on port ~a." description port-number))
+      (custodian-shutdown-all main-cust)
+      #t)))
+
+(define (accept-and-handle listener handler)
+  (define cust (make-custodian))
+  (parameterize ([current-custodian cust])
+    (define-values (in out) (tcp-accept listener))
+    (define-values (local-ip local-port remote-ip remote-port) (tcp-addresses in #t))
+    (log (format "Incoming connection from ~a:~a." remote-ip remote-port))
+    (thread (lambda ()
+              (handler in out)
+              (close-input-port in)
+              (close-output-port out)
+              (log (format "Connection from ~a:~a closed." remote-ip remote-port))))))
+
+; ########## Game Server Code ##########
+
+(define (player-connected current-player)
+  (hash-set! players (player-name current-player) current-player)
+  (log (format "Player '~a' has logged on from ~a:~a." 
+               (player-name current-player) 
+               (player-remote-ip current-player)
+               (player-remote-port current-player)))
+  (send-message-to-player current-player (format "Welcome, ~a!~n" (player-name current-player)))
+  (send-message-to-room (player-room current-player) (format "~a has logged on." (player-name current-player))))
 
 (define (player-disconnected current-player)
   (cond
-    [(player? current-player)
+    [(and (player? current-player) (hash-has-key? players (player-name current-player)))
      (hash-remove! players (player-name current-player))
-     (send-message-to-room (player-room current-player) (format "~a has logged out." (player-name current-player)))])
+     (log (format "Player '~a' has logged off from ~a:~a."
+                  (player-name current-player) 
+                  (player-remote-ip current-player)
+                  (player-remote-port current-player)))
+     (send-message-to-room (player-room current-player) (format "~a has logged off." (player-name current-player)))])
   #f)
 
 (define (read-trimmed-line in current-player)
-         (let ([line (read-line in)])
-           (if (string? line)
-               (string-trim line)
-               (player-disconnected current-player))))
+  (if (port-closed? in)
+      (player-disconnected current-player)
+      (let ([line (read-line in)])
+        (if (string? line)
+            (string-trim line)
+            (player-disconnected current-player)))))
 
 (define (parse-command-helper line current-player)
   ; TODO: Make this a more complicated parser
@@ -63,15 +118,16 @@
       ; Empty String
       [(string? line) (values (get-command "noop") '())]
       ; Disconnect
-      [else (values(#f #f))])))
+      [else (values #f #f)])))
 
 (define (login in out)
-  (fprintf out "Name: ")
-  (flush-output out)
-  (let ([name (read-trimmed-line in #f)])
-    (cond [(and (string? name) (not (equal? "" name)) (not (hash-has-key? players name))) name]
-          [(not name) #f]
-          [else (login in out)])))
+  (cond [(not (port-closed? out))
+         (write-and-flush out "Name: ")
+         (let ([name (read-trimmed-line in #f)])
+           (cond [(and (string? name) (not (equal? "" name)) (not (hash-has-key? players name))) name]
+                 [(not name) #f]
+                 [else (login in out)]))]
+        [else #f]))
   
 (define (write-and-flush out message)
   (display message out)
@@ -115,9 +171,14 @@
     (cond [(equal? room-id (player-room current-player))
            (send-message-to-player current-player message)])))
 
+(define (display-prompt current-player)
+  (cond [(not (port-closed? (player-out current-player)))
+         (let ([prompt-string "> "])
+           (write-and-flush (player-out current-player) prompt-string))]
+        [else #f]))
+
 (define (game-loop current-player)
-  (fprintf (player-out current-player) "> ")
-  (flush-output (player-out current-player))
+  (display-prompt current-player)
   (let-values ([(cmd args) (parse-command current-player)])
     (cond 
       [(command? cmd) 
@@ -128,17 +189,21 @@
 (define (handle-telnet in out)
   (let ([name (login in out)])
     (if name
-        (let ([current-player (player name 'main in out)])
-          (hash-set! players (player-name current-player) current-player)
-          (fprintf out "Welcome, ~a!~n" (player-name current-player))
-          (send-message-to-room (player-room current-player) (format "~a has logged on." (player-name current-player)))
-          (display-room current-player (player-room current-player))
-          (game-loop current-player))
-        #f)))
+        (let-values ([(local-ip local-port remote-ip remote-port) (tcp-addresses in #t)])
+          (let ([current-player (player name 'main in out remote-ip remote-port)])
+            (player-connected current-player)
+            (display-room current-player (player-room current-player))
+            (game-loop current-player)))
+          #f)))
+
+
+(define stop-mush (lambda (x) #f))
 
 (define (start-mush [port 2222] [title "mush"])
-  (tcp:serve title port handle-telnet))
+  (set! stop-mush (serve title port handle-telnet)))
 
+; ########## Commands ##########
+  
 ; TODO: Make the list of commands configurable
 (hash-set! commands "noop"
           (command "noop"
@@ -207,4 +272,19 @@
                                                  (lambda (x y) (string<? (player-name x) (player-name y)))))))))))
 (hash-set! commands "w" (hash-ref commands "who"))
 
-(define stop-mush (start-mush))
+; ########## Rooms ##########
+  
+; TODO: This should be configurable
+(hash-set! rooms 'main (room 'main 
+      "Entrance Hall" 
+      "This is where new players appear before they enter the game."
+      '()
+      (list (door '("north" "n") "A path to the north leads to town."))))
+
+; ########## Main ##########
+(define (main)
+  (init-logging)
+  (start-mush)
+  #t)
+
+(void (main))
