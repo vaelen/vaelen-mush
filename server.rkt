@@ -87,16 +87,21 @@
            (send-message-to-room old-room-id format("~a has gone."))
            (send-message-to-room new-room-id format("~a has arrived."))])))
 
-(define (generate-room-description current-room)
-  (format "~a~n~a~n~nExits:\n~a" 
+(define (generate-room-description current-room current-player)
+  (format "~a~n~a~n~nExits:~n~a~n~a" 
           (room-name current-room) 
-          (room-description current-room) 
-          (string-join (map (lambda (x) (format "\t~a:\t~a~n" (first (door-names x)) (door-description x))) (room-doors current-room)))))
+          (room-description current-room)
+          (string-join (map (lambda (x) (format "\t~a:\t~a~n" (first (door-names x)) (door-description x))) (room-doors current-room)))
+          (string-join (map (lambda (x) (format "~a is here.~n" (player-name x))) 
+                            (filter (lambda (x) 
+                                      (and (equal? (room-id current-room) (player-room x))
+                                           (not (equal? (player-name current-player) (player-name x))))) 
+                                    (hash-values players))))))
 
 (define (display-room current-player room-id)
   (let ([current-room (get-room room-id)])
     (cond [(room? current-room)
-            (send-message-to-player current-player (generate-room-description current-room))]
+            (send-message-to-player current-player (generate-room-description current-room current-player))]
            [else
             (send-message-to-player current-player "You have no idea where you are!")])))
 
@@ -194,7 +199,7 @@
                       current-player 
                       (format "Players Online:~nName\tLocation~n------------------------------~n~a" 
                               (string-join (map (lambda (x) 
-                                                  (format "~a\t~a" 
+                                                  (format "~a\t~a~n" 
                                                           (player-name x)
                                                           (room-name (get-room (player-room x))))) 
                                                 (sort 
