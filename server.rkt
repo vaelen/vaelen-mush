@@ -1,7 +1,7 @@
 #lang racket
 (require racket/date)
 
-(provide 
+(provide
  (all-defined-out)
  (struct-out player)
  (struct-out room)
@@ -10,14 +10,18 @@
 
 ; ########## Data Structures ##########
 
-(struct player (name room in out remote-ip remote-port) #:mutable)
-(struct room (id name description inventory doors) #:mutable)
-(struct door (names description) #:mutable)
-(struct command (name description function) #:mutable)
+(struct player (name room in out remote-ip remote-port) #:mutable #:prefab)
+(struct room (id name description inventory doors) #:mutable #:prefab)
+(struct door (names description) #:mutable #:prefab)
+(struct command (name description function) #:mutable #:prefab)
 
 (define players (make-hash))
 (define rooms (make-hash))
 (define commands (make-hash))
+(define world #hash(
+                    ('players . players)
+                    ('rooms . rooms)
+                    ('commands . commands)))
 
 (define (get-player player-id)
   (hash-ref players player-id #f))
@@ -46,7 +50,7 @@
   (define main-cust (make-custodian))
   (parameterize ([current-custodian main-cust])
     (define listener (tcp-listen port-number 5 #t))
-    (define (start-server) 
+    (define (start-server)
       (log (format "Starting ~a server on port ~a." description port-number))
       (server-loop))
     (define (server-loop)
@@ -74,8 +78,8 @@
 
 (define (player-connected current-player)
   (hash-set! players (player-name current-player) current-player)
-  (log (format "Player '~a' has logged on from ~a:~a." 
-               (player-name current-player) 
+  (log (format "Player '~a' has logged on from ~a:~a."
+               (player-name current-player)
                (player-remote-ip current-player)
                (player-remote-port current-player)))
   (send-message-to-player current-player (format "Welcome, ~a!~n" (player-name current-player)))
@@ -86,7 +90,7 @@
     [(and (player? current-player) (hash-has-key? players (player-name current-player)))
      (hash-remove! players (player-name current-player))
      (log (format "Player '~a' has logged off from ~a:~a."
-                  (player-name current-player) 
+                  (player-name current-player)
                   (player-remote-ip current-player)
                   (player-remote-port current-player)))
      (send-message-to-room (player-room current-player) (format "~a has logged off." (player-name current-player)))])
@@ -101,7 +105,6 @@
             (player-disconnected current-player)))))
 
 (define (parse-command-helper line current-player)
-  ; TODO: Make this a more complicated parser
   (let ([args (string-split line)]
         [name ""]
         [cmd #f])
@@ -112,7 +115,7 @@
 
 (define (parse-command current-player)
   (let ([line (read-trimmed-line (player-in current-player) current-player)])
-    (cond 
+    (cond
       ; Command
       [(and (string? line) (not (equal? "" line))) (parse-command-helper line current-player)]
       ; Empty String
@@ -128,7 +131,7 @@
                  [(not name) #f]
                  [else (login in out)]))]
         [else #f]))
-  
+
 (define (write-and-flush out message)
   (display message out)
   (flush-output out))
@@ -144,14 +147,14 @@
            (send-message-to-room new-room-id format("~a has arrived."))])))
 
 (define (generate-room-description current-room current-player)
-  (format "~a~n~a~n~nExits:~n~a~n~a" 
-          (room-name current-room) 
+  (format "~a~n~a~n~nExits:~n~a~n~a"
+          (room-name current-room)
           (room-description current-room)
           (string-join (map (lambda (x) (format "\t~a:\t~a~n" (first (door-names x)) (door-description x))) (room-doors current-room)))
-          (string-join (map (lambda (x) (format "~a is here.~n" (player-name x))) 
-                            (filter (lambda (x) 
+          (string-join (map (lambda (x) (format "~a is here.~n" (player-name x)))
+                            (filter (lambda (x)
                                       (and (equal? (room-id current-room) (player-room x))
-                                           (not (equal? (player-name current-player) (player-name x))))) 
+                                           (not (equal? (player-name current-player) (player-name x)))))
                                     (hash-values players))))))
 
 (define (display-room current-player room-id)
@@ -180,8 +183,8 @@
 (define (game-loop current-player)
   (display-prompt current-player)
   (let-values ([(cmd args) (parse-command current-player)])
-    (cond 
-      [(command? cmd) 
+    (cond
+      [(command? cmd)
        ((command-function cmd) current-player args)
        (game-loop current-player)]
       [else #f])))
@@ -203,7 +206,7 @@
   (set! stop-mush (serve title port handle-telnet)))
 
 ; ########## Commands ##########
-  
+
 ; TODO: Make the list of commands configurable
 (hash-set! commands "noop"
           (command "noop"
@@ -260,26 +263,39 @@
           (command "who"
                    "See who's online."
                    (lambda (current-player args)
-                     (send-message-to-player 
-                      current-player 
-                      (format "Players Online:~nName\tLocation~n------------------------------~n~a" 
-                              (string-join (map (lambda (x) 
-                                                  (format "~a\t~a~n" 
+                     (send-message-to-player
+                      current-player
+                      (format "Players Online:~nName\tLocation~n------------------------------~n~a"
+                              (string-join (map (lambda (x)
+                                                  (format "~a\t~a~n"
                                                           (player-name x)
-                                                          (room-name (get-room (player-room x))))) 
-                                                (sort 
+                                                          (room-name (get-room (player-room x)))))
+                                                (sort
                                                  (hash-values players)
                                                  (lambda (x y) (string<? (player-name x) (player-name y)))))))))))
 (hash-set! commands "w" (hash-ref commands "who"))
 
 ; ########## Rooms ##########
-  
+
 ; TODO: This should be configurable
-(hash-set! rooms 'main (room 'main 
-      "Entrance Hall" 
+(hash-set! rooms 'main (room 'main
+      "Entrance Hall"
       "This is where new players appear before they enter the game."
       '()
       (list (door '("north" "n") "A path to the north leads to town."))))
+
+; ########## Data Storage and Retrieval ##########
+
+; TODO: Lots to do here.  Eventually these methods will persist the state of the world to disk.
+(define (save-world)
+  (print-struct #t)
+  (print-hash-table #t)
+  (print-as-expression #f)
+  (print-graph #t)
+  (write world))
+
+(define (load-world)
+  (void))
 
 ; ########## Main ##########
 (define (main)
@@ -287,4 +303,4 @@
   (start-mush)
   #t)
 
-(void (main))
+(void (main) (save-world))
