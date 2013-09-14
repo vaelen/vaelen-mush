@@ -12,7 +12,7 @@
 
 (struct player (name room in out remote-ip remote-port) #:mutable #:prefab)
 (struct room (id name description inventory doors) #:mutable #:prefab)
-(struct door (names description) #:mutable #:prefab)
+(struct door (names description dest-room) #:mutable #:prefab)
 (struct command (name description function) #:mutable #:prefab)
 
 (define players (make-hash))
@@ -136,21 +136,25 @@
   (display message out)
   (flush-output out))
 
-(define (move-player current-player new-room-id direction)
+(define (move-player current-player new-room-id [direction #f] [source-direction #f])
   (let ([old-room-id (player-room current-player)])
     (set-player-room! current-player new-room-id)
-    (cond [direction
-           (send-message-to-room old-room-id format("~a has gone ~a"))
-           (send-message-to-room new-room-id format("~a has arrived."))]
-          [else
-           (send-message-to-room old-room-id format("~a has gone."))
-           (send-message-to-room new-room-id format("~a has arrived."))])))
+    (display-room current-player (player-room current-player))
+    (if direction
+        (send-message-to-room old-room-id (format"~a has gone ~a." (player-name current-player) direction))
+        (send-message-to-room old-room-id (format"~a has gone." (player-name current-player))))
+    (if source-direction
+        (send-message-to-room new-room-id (format"~a has arrived from the ~a." (player-name current-player) source-direction))
+        (send-message-to-room new-room-id (format"~a has arrived." (player-name current-player))))))
 
 (define (generate-room-description current-room current-player)
   (format "~a~n~a~n~nExits:~n~a~n~a"
           (room-name current-room)
           (room-description current-room)
-          (string-join (map (lambda (x) (format "\t~a:\t~a~n" (first (door-names x)) (door-description x))) (room-doors current-room)))
+          (string-join (map (lambda (x) (format "\t~a:\t~a~n"
+                                                (first (door-names x))
+                                                (door-description x)))
+                            (room-doors current-room)))
           (string-join (map (lambda (x) (format "~a is here.~n" (player-name x)))
                             (filter (lambda (x)
                                       (and (equal? (room-id current-room) (player-room x))
@@ -193,7 +197,7 @@
   (let ([name (login in out)])
     (if name
         (let-values ([(local-ip local-port remote-ip remote-port) (tcp-addresses in #t)])
-          (let ([current-player (player name 'main in out remote-ip remote-port)])
+          (let ([current-player (player name 0 in out remote-ip remote-port)])
             (player-connected current-player)
             (display-room current-player (player-room current-player))
             (game-loop current-player)))
@@ -204,6 +208,37 @@
 
 (define (start-mush [port 2222] [title "mush"])
   (set! stop-mush (serve title port handle-telnet)))
+
+; ########## Command Helper Functions ##########
+
+(define (find-exit current-player direction)
+  (let ([current-room (get-room (player-room current-player))]
+        [lcase-direction (string-downcase direction)])
+    (if (room? current-room)
+        (findf
+         (lambda (current-door)
+           (findf
+            (lambda (current-name)
+              (equal? (string-downcase current-name) lcase-direction))
+            (door-names current-door)))
+         (room-doors current-room))
+        #f)))
+
+(define (find-entrance current-player exit)
+  (let ([current-room (get-room (player-room current-player))]
+        [new-room #f]
+        [old-room-id #f])
+    (if (and (room? current-room) (door? exit))
+        (begin
+          (set! old-room-id (room-id current-room))
+          (set! new-room (get-room (door-dest-room exit)))
+          (if (room? new-room)
+              (findf
+               (lambda (current-door)
+                 (equal? old-room-id (door-dest-room current-door)))
+               (room-doors new-room))
+              #f))
+        #f)))
 
 ; ########## Commands ##########
 
@@ -217,7 +252,9 @@
           (command "say"
                    "Say something to the room."
                    (lambda (current-player args)
-                     (send-message-to-room (player-room current-player) (format "~a: ~a" (player-name current-player) (string-join args))))))
+                     (send-message-to-room
+                      (player-room current-player)
+                      (format "~a: ~a" (player-name current-player) (string-join args))))))
 (hash-set! commands "s" (hash-ref commands "say"))
 (hash-set! commands "'" (hash-ref commands "say"))
 (hash-set! commands "\"" (hash-ref commands "say"))
@@ -236,18 +273,37 @@
                      (cond [(empty? args) (send-message-to-player current-player "Commands: say, look, go, who, help, quit")]
                            [else
                             (let ([cmd (get-command (first args))])
-                              (cond [(command? cmd) (send-message-to-player current-player (format "~a: ~a" (command-name cmd) (command-description cmd)))]))]))))
+                              (cond [(command? cmd)
+                                     (send-message-to-player current-player
+                                                             (format "~a: ~a"
+                                                                     (command-name cmd)
+                                                                     (command-description cmd)))]))]))))
 (hash-set! commands "h" (hash-ref commands "help"))
 
 (hash-set! commands "go"
           (command "go"
                    "Go somewhere."
                    (lambda (current-player args)
-                     (send-message-to-player current-player "You can't go anywhere yet."))))
+                     (let ([exit (find-exit current-player (first args))]
+                           [entrance #f])
+                       (set! entrance (find-entrance current-player exit))
+                       (if (door? exit)
+                           (if (door? entrance)
+                               (move-player
+                                current-player
+                                (door-dest-room exit)
+                                (first (door-names exit))
+                                (first (door-names entrance)))
+                               (move-player
+                                current-player
+                                (door-dest-room exit)
+                                (first (door-names exit))))
+                           (send-message-to-player current-player "You can't go that way."))))))
 (hash-set! commands "g" (hash-ref commands "go"))
 (hash-set! commands "walk" (hash-ref commands "go"))
 (hash-set! commands "run" (hash-ref commands "go"))
 (hash-set! commands "climb" (hash-ref commands "go"))
+(hash-set! commands "move" (hash-ref commands "go"))
 
 (hash-set! commands "quit"
           (command "quit"
@@ -278,11 +334,25 @@
 ; ########## Rooms ##########
 
 ; TODO: This should be configurable
-(hash-set! rooms 'main (room 'main
-      "Entrance Hall"
-      "This is where new players appear before they enter the game."
-      '()
-      (list (door '("north" "n") "A path to the north leads to town."))))
+(hash-set! rooms 0 (room 0
+                         "Entrance Hall"
+                         "This is where new players appear before they enter the game."
+                         '()
+                         (list (door '("north" "n") "A path to the north leads to town." 1))))
+
+(hash-set! rooms 1 (room 1
+                         "Empty Field"
+                         "This large empty field contains a path that leads to and from town."
+                         '()
+                         (list
+                          (door '("north" "n") "A path to the north leads to town." 2)
+                          (door '("south" "s") "A path to the south leads to the entrance hall." 0))))
+
+(hash-set! rooms 2 (room 2
+                         "Town Gate"
+                         "You are standing in front of the town gate.  A large wooden wall extends around the town in both directions.  The gate is shut tight."
+                         '()
+                         (list (door '("south" "s") "A path to the south leads to the entrance hall." 1))))
 
 ; ########## Data Storage and Retrieval ##########
 
